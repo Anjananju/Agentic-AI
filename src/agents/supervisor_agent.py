@@ -1,9 +1,8 @@
 # src/agents/supervisor_agent.py
 import uuid
 import json
-import re
+from typing import Any, Dict, List
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Any
 
 from observability.logger import get_logger
 from session.in_memory_session import InMemorySessionService
@@ -13,17 +12,6 @@ log = get_logger('supervisor')
 
 
 class SupervisorAgent:
-    """
-    Optimized SupervisorAgent:
-    - Produces an outline via OutlineAgent (1 LLM call)
-    - Generates all sections in a single LLM call that returns JSON (1 LLM call)
-    - Edits all sections in a single LLM call that returns JSON (1 LLM call)
-    - Runs SEO (1 LLM call)
-    This reduces the number of LLM calls dramatically compared to drafting+editing each
-    section separately.
-    Falls back to the previous per-section behavior if JSON parsing fails.
-    """
-
     def __init__(self, llm_provider, workers: int = 4):
         self.llm = llm_provider
         self.session_svc = InMemorySessionService()
@@ -31,7 +19,7 @@ class SupervisorAgent:
         self.workers = workers
         self.executor = ThreadPoolExecutor(max_workers=workers)
 
-        # lazy-import agents to avoid circular issues
+        # lazy import agents
         from agents.outline_agent import OutlineAgent
         from agents.draft_agent import DraftAgent
         from agents.editor_agent import EditorAgent
@@ -40,30 +28,145 @@ class SupervisorAgent:
 
         self.research_agent = ResearchAgent()
         self.outline_agent = OutlineAgent(self.llm)
-        self.draft_agent = DraftAgent(self.llm)      # kept for fallback
-        self.editor_agent = EditorAgent(self.llm)    # kept for fallback
+        self.draft_agent = DraftAgent(self.llm)
+        self.editor_agent = EditorAgent(self.llm)
         self.seo_agent = SEOAgent(self.llm)
 
-    def start_job(self, topic: str, audience: str, references: List[str] = None) -> Dict[str, Any]:
+    # ================================
+    # JOB ENTRYPOINT
+    # ================================
+    def start_job(self, topic: str, audience: str, references: list = None) -> Dict[str, Any]:
         job_id = str(uuid.uuid4())
         self.session_svc.create_session(job_id, {'status': 'running', 'topic': topic})
         log.info(f"Starting job {job_id} for topic={topic}")
 
-        # Step 1: research (may be empty if no refs)
+        # Step 1: Research
         research = self.research_agent.run(topic, references)
         self.session_svc.update_session(job_id, {'research': research})
 
-        # Step 2: outline (single LLM call via OutlineAgent)
+        # Step 2: Outline
         outline = self.outline_agent.run(topic, audience)
         self.session_svc.update_session(job_id, {'outline': outline})
 
-        # Step 3: Generate all sections in one LLM call (preferred)
+        # Step 3: Generate all sections (fast batch mode)
+        sections = self.generate_sections_batch(outline)
+
+        # Step 4: Assemble full content
+        full_content = "\n\n".join([
+            f"## {sec['heading']}\n\n{sec['content']}"
+            for sec in sections
+        ])
+
+        # Step 5: SEO optimization
+        seo = self.seo_agent.run(topic, full_content)
+
+        # Final result
+        result = {
+            'job_id': job_id,
+            'topic': topic,
+            'outline': outline,
+            'sections': sections,
+            'content': full_content,
+            'seo': seo,
+            'research': research
+        }
+
+        self.session_svc.update_session(job_id, {'status': 'completed', 'result': result})
+        log.info(f"Completed job {job_id}")
+
+        return result
+
+    # ================================
+    # NEW: FAST BATCH SECTION GENERATION
+    # ================================
+    def generate_sections_batch(self, outline: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        """
+        Single LLM call → generates all drafts.
+        Single LLM call → edits all drafts.
+        Much faster + avoids prompt leak.
+        """
+        prompt = (
+            "You are an expert content generator.\n"
+            "Generate a JSON array of blog sections.\n\n"
+            "Each section must have this structure:\n"
+            "{ \"heading\": \"...\", \"content\": \"...\" }\n\n"
+            "Generate detailed sections based on this outline:\n"
+            f"{json.dumps(outline, indent=2)}\n\n"
+            "Return ONLY valid JSON. No commentary."
+        )
+
+        raw = self.llm.generate(prompt)
+
         try:
-            sections = self._generate_all_sections_from_outline(outline, topic, audience)
-            # If generation returned something unexpected, fall back
-            if not isinstance(sections, list) or len(sections) == 0:
-                raise ValueError("Invalid sections generated")
-        except Exception as e:
+            sections = json.loads(raw)
+            if isinstance(sections, list):
+                pass
+            else:
+                raise ValueError("Not a list")
+        except Exception:
+            log.warning("Batch JSON failed. Falling back to per-section mode.")
+            return self.generate_sections_fallback(outline)
+
+        # EDIT ALL SECTIONS IN ONE CALL
+        edit_prompt = (
+            "You are an expert editor.\n"
+            "Improve clarity, grammar, structure.\n"
+            "Return ONLY JSON of this form:\n"
+            "[ {\"heading\": \"...\", \"content\": \"...\"}, ... ]\n\n"
+            "EDIT THESE SECTIONS:\n"
+            f"{json.dumps(sections, indent=2)}\n"
+        )
+
+        edited_raw = self.llm.generate(edit_prompt)
+
+        try:
+            edited_sections = json.loads(edited_raw)
+            return edited_sections
+        except Exception:
+            log.warning("Batch edit failed, returning unedited sections.")
+            return sections
+
+    # ================================
+    # FALLBACK (OLD MODE)
+    # ================================
+    def generate_sections_fallback(self, outline: List[Dict[str, Any]]):
+        futures = []
+        sections = []
+
+        for s in outline:
+            futures.append(self.executor.submit(
+                self._draft_and_edit,
+                s["heading"],
+                s.get("bullets", [])
+            ))
+
+        for f in futures:
+            sections.append(f.result())
+
+        return sections
+
+    # OLD draft + edit
+    def _draft_and_edit(self, heading, bullets):
+        draft = self.draft_agent.expand(heading, bullets)
+        edited = self.editor_agent.run(draft)
+        return {'heading': heading, 'content': edited}
+
+    # Pause & Resume
+    def pause_job(self, job_id: str):
+        self.session_svc.update_session(job_id, {"status": "paused"})
+        log.info(f"Paused job {job_id}")
+
+    def resume_job(self, job_id: str) -> Dict[str, Any]:
+        sess = self.session_svc.get_session(job_id)
+        if not sess:
+            raise KeyError("job not found")
+
+        if sess.get("status") != "paused":
+            return sess
+
+        self.session_svc.update_session(job_id, {"status": "running"})
+        log.info(f"Resumed job {job_id}")
+        return sess
             log.info(f"Batch generation failed ({e}), falling back to per-section generation")
             sections = self._generate_sections_fallback(outline)
 
