@@ -106,6 +106,11 @@ class HuggingFaceProvider(LLMProvider):
         except Exception as e:
             return f"[HF ERROR] {e}\nPROMPT: {prompt[:200]}"
 
+        # Alias for SupervisorAgent compatibility
+    def generate(self, prompt: str) -> str:
+        """SupervisorAgent expects .generate(). We map it to .complete()."""
+        return self.complete(prompt)
+
 
 
 class HTTPProvider(LLMProvider):
