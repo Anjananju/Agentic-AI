@@ -30,7 +30,7 @@ with col2:
         endpoint = st.text_input('HTTP Endpoint', '')
 
 if 'supervisor' not in st.session_state:
-    hf = HuggingFaceProvider(model_name="google/gemma-2b-it")
+    hf = HuggingFaceProvider(model_name="Qwen/Qwen2.5-1.5B-Instruct")
     st.session_state.supervisor = SupervisorAgent(hf)
 
 if run:
