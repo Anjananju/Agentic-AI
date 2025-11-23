@@ -77,6 +77,98 @@ class SupervisorAgent:
         return result
 
     # ================================
+    # FAST BATCH SECTION GENERATION
+    # ================================
+    def generate_sections_batch(self, outline: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        prompt = (
+            "You are an expert writer.\n"
+            "Generate a JSON array of blog sections.\n"
+            "Each item must be: { \"heading\": \"...\", \"content\": \"...\" }\n\n"
+            "Outline:\n"
+            f"{json.dumps(outline, indent=2)}\n\n"
+            "Return ONLY valid JSON."
+        )
+
+        raw = self.llm.generate(prompt)
+
+        try:
+            sections = json.loads(raw)
+            if not isinstance(sections, list):
+                raise ValueError("Expected list")
+        except Exception:
+            return self.generate_sections_fallback(outline)
+
+        # EDIT ALL SECTIONS IN ONE CALL
+        edit_prompt = (
+            "You are an expert editor. Improve clarity, grammar, and structure.\n"
+            "Return ONLY JSON array.\n\n"
+            f"EDIT THESE SECTIONS:\n{json.dumps(sections, indent=2)}"
+        )
+        edited_raw = self.llm.generate(edit_prompt)
+
+        try:
+            edited_sections = json.loads(edited_raw)
+            return edited_sections
+        except Exception:
+            return sections
+
+    # ================================
+    # FALLBACK (OLD INDIVIDUAL GENERATION)
+    # ================================
+    def generate_sections_fallback(self, outline: List[Dict[str, Any]]):
+        futures = []
+        sections = []
+
+        for s in outline:
+            futures.append(self.executor.submit(
+                self._draft_and_edit,
+                s["heading"],
+                s.get("bullets", [])
+            ))
+
+        for f in futures:
+            sections.append(f.result())
+
+        return sections
+
+    def _draft_and_edit(self, heading, bullets):
+        draft = self.draft_agent.expand(heading, bullets)
+        edited = self.editor_agent.run(draft)
+        return {'heading': heading, 'content': edited}
+
+    # ================================
+    # PAUSE & RESUME
+    # ================================
+    def pause_job(self, job_id: str):
+        self.session_svc.update_session(job_id, {"status": "paused"})
+        log.info(f"Paused job {job_id}")
+
+    def resume_job(self, job_id: str) -> Dict[str, Any]:
+        sess = self.session_svc.get_session(job_id)
+        if not sess:
+            raise KeyError("job not found")
+
+        if sess.get("status") != "paused":
+            return sess
+
+        self.session_svc.update_session(job_id, {"status": "running"})
+        log.info(f"Resumed job {job_id}")
+        return sess
+            'job_id': job_id,
+            'topic': topic,
+            'outline': outline,
+            'sections': sections,
+            'content': full_content,
+            'seo': seo,
+            'research': research
+        }
+
+        self.session_svc.update_session(job_id, {'status': 'completed', 'result': result})
+        log.info(f"Completed job {job_id}")
+
+        return result
+
+    # ================================
     # NEW: FAST BATCH SECTION GENERATION
     # ================================
     def generate_sections_batch(self, outline: List[Dict[str, Any]]) -> List[Dict[str, str]]:
