@@ -30,8 +30,7 @@ with col2:
         endpoint = st.text_input('HTTP Endpoint', '')
 
 if 'supervisor' not in st.session_state:
-    # default to mock HF provider (uses small/gpt2-like default)
-    hf = HuggingFaceProvider(model_name=os.getenv('HF_MODEL', 'gpt2'))
+    hf = HuggingFaceProvider(model_name="google/gemma-2b-it")
     st.session_state.supervisor = SupervisorAgent(hf)
 
 if run:
